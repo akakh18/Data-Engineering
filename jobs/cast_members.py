@@ -1,53 +1,17 @@
 from pyspark import SparkConf
-from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import SparkSession
 import pyspark.sql.functions as f
+
 from pyspark.sql.types import *
 from pyspark.sql.functions import monotonically_increasing_id
 
-PARQUET_FORMAT = 'parquet'
-OVERWRITE_MODE = 'overwrite'
-VOICE = 'voice'
-PLAYER = 'actor/actress'
-
-
-# Cast
-def get_cast_table(cast_members_arg: DataFrame) -> None:
-    cast = cast_members_arg \
-        .withColumnRenamed('id', 'cast_member_id') \
-        .withColumn('id', monotonically_increasing_id()) \
-        .select('id', 'cast_member_id', 'film_id', 'name')
-
-    cast.write.saveAsTable(name='films.DimCast', format=PARQUET_FORMAT, mode=OVERWRITE_MODE)
-
-
-# Characters
-def get_roles_table(cast_members_arg: DataFrame) -> None:
-    character = cast_members_arg \
-        .withColumnRenamed('id', 'cast_member_id') \
-        .withColumn('id', monotonically_increasing_id()) \
-        .select('id', 'cast_member_id', 'character')
-
-    character.write.saveAsTable(name='films.DimRoles', format=PARQUET_FORMAT, mode=OVERWRITE_MODE)
-
-
-# Cast Roles
-def get_characters_table(cast_members_arg: DataFrame) -> None:
-    role = cast_members_arg \
-        .withColumn('is_voice', f.col('character').contains('(voice)')) \
-        .withColumn('role', f.when(f.col('is_voice'), VOICE).otherwise(PLAYER)) \
-        .withColumnRenamed('id', 'cast_member_id') \
-        .withColumn('id', monotonically_increasing_id()) \
-        .select('id', 'cast_member_id', 'role').where(f.col('role') == PLAYER)
-
-    role.write.saveAsTable(name='films.DimCharacters', format=PARQUET_FORMAT, mode=OVERWRITE_MODE)
-
+print(" ---------------- :: STARTED :: ---------------")
 
 app_name = 'final_project'
 
 conf = SparkConf()
 
 hdfs_host = 'hdfs://namenode:8020'
-data_lake_path = f'{hdfs_host}/data_lake'
 
 conf.set("hive.metastore.uris", "http://hive-metastore:9083")
 conf.set("spark.kerberos.access.hadoopFileSystem", hdfs_host)
@@ -60,7 +24,7 @@ spark = SparkSession \
     .config(conf=conf) \
     .getOrCreate()
 
-spark.sql(f"create schema if not exists films location '{hdfs_host}/movies'")
+data_lake_path = f'{hdfs_host}/data_lake'
 
 cast_schema = ArrayType(StructType([StructField('cast_id', IntegerType(), True),
                                     StructField('character', StringType(), True),
@@ -76,7 +40,7 @@ creds = spark \
     .read \
     .option("quote", "\"") \
     .option("escape", "\"") \
-    .csv('credits.csv', header=True) \
+    .csv('/airflow/jobs/credits.csv', header=True) \
     .withColumn('cast', f.regexp_replace(f.col('cast'), ': None', ': null')) \
     .withColumn('cast', f.regexp_replace(f.col('cast'), "\\\\'", "")) \
     .withColumn('cast', f.regexp_replace(f.col('cast'), "\\\\", ""))
@@ -84,10 +48,47 @@ creds = spark \
 creds = creds \
     .withColumn('cast_members', f.from_json(creds.cast, cast_schema))
 
+# Records that have schema issues:
+
+rec_with_issues = creds.where(f.col('cast_members').isNull())
+
 cast_members = creds \
     .withColumn('member', f.explode('cast_members')).withColumnRenamed('id', 'film_id') \
     .select('film_id', 'member.name', 'member.gender', 'member.character', 'member.id')
 
-get_cast_table(cast_members)
-get_characters_table(cast_members)
-get_roles_table(cast_members)
+database = 'films_v5'
+
+spark.sql(f"create schema if not exists {database} location '{hdfs_host}/films'")
+
+cast = cast_members \
+    .withColumnRenamed('id', 'cast_member_id') \
+    .withColumn('id', monotonically_increasing_id()) \
+    .select('id', 'cast_member_id', 'film_id', 'name')
+
+cast.write.option('path', f'{data_lake_path}/{database}/Cast') \
+    .saveAsTable(name=f'{database}.DimCast', format='parquet')
+
+# Character
+
+characters = cast_members \
+    .withColumnRenamed('id', 'cast_member_id') \
+    .withColumn('id', monotonically_increasing_id()) \
+    .select('id', 'cast_member_id', 'character')
+
+characters.write.option('path', f'{data_lake_path}/{database}/Characters') \
+    .saveAsTable(name=f'{database}.DimCharacters', format='parquet')
+
+VOICE = 'voice'
+PLAYER = 'actor/actress'
+
+role = cast_members \
+    .withColumn('is_voice', f.col('character').contains('(voice)')) \
+    .withColumn('role', f.when(f.col('is_voice'), VOICE).otherwise(PLAYER)) \
+    .withColumnRenamed('id', 'cast_member_id') \
+    .withColumn('id', monotonically_increasing_id()) \
+    .select('id', 'cast_member_id', 'role').where(f.col('role') == PLAYER)
+
+role.write.option('path', f'{data_lake_path}/{database}/DimRoles') \
+    .saveAsTable(name=f'{database}.DimRoles', format='parquet')
+
+spark.sql('select * from films_v5.dimcast').show(10, truncate=False)
